@@ -2,11 +2,14 @@ package gen
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"strings"
 	"text/template"
 
 	"github.com/golang/glog"
 	"github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway/descriptor"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // This function is called with a param which contains the entire definition of a method.
@@ -14,7 +17,8 @@ func applyTemplate(f *descriptor.File, opts Options) (string, error) {
 	w := bytes.NewBuffer(nil)
 
 	if err := headerTemplate.Execute(w, tplHeader{
-		File: f,
+		File:    f,
+		Options: opts,
 	}); err != nil {
 		return "", err
 	}
@@ -27,7 +31,13 @@ func applyTemplate(f *descriptor.File, opts Options) (string, error) {
 		}
 		msgName := camelCase(*msg.Name)
 		msg.Name = &msgName
-		if err := messageTemplate.Execute(w, tplMessage{
+		if err := marshal(w, tplMessage{
+			Message: msg,
+			Options: opts,
+		}); err != nil {
+			return "", err
+		}
+		if err := unmarshalTemplate.Execute(w, tplMessage{
 			Message: msg,
 			Options: opts,
 		}); err != nil {
@@ -40,6 +50,7 @@ func applyTemplate(f *descriptor.File, opts Options) (string, error) {
 
 type tplHeader struct {
 	*descriptor.File
+	Options
 }
 
 type tplMessage struct {
@@ -66,28 +77,116 @@ package {{.GoPkg.Name}}
 
 import (
 	"bytes"
+	"strconv"
+	"strings"
 
 	"github.com/golang/protobuf/jsonpb"
 )
+
+// Options
+const AllowUnknownFields = {{.AllowUnknownFields}}
+const EmitDefaults       = {{.EmitDefaults}}
+const EnumsAsInts        = {{.EnumsAsInts}}
+const OrigName           = {{.OrigName}}
+
+// TODO
+func jsonStringify(s string) string {
+	var sb strings.Builder
+	sb.WriteString("\"")
+	sb.WriteString(s) // FIXME
+	sb.WriteString("\"")
+	return sb.String()
+}
+
 `))
 
-	messageTemplate = template.Must(template.New("message").Parse(`
-// MarshalJSON implements json.Marshaler
-func (msg *{{.TypeName}}) MarshalJSON() ([]byte,error) {
-	var buf bytes.Buffer
-	err := (&jsonpb.Marshaler{
-	  EnumsAsInts: {{.EnumsAsInts}},
-	  EmitDefaults: {{.EmitDefaults}},
-	  OrigName: {{.OrigName}},
-	}).Marshal(&buf, msg)
-	return buf.Bytes(), err
-}
+	unmarshalTemplate = template.Must(template.New("message").Parse(`
 
 // UnmarshalJSON implements json.Unmarshaler
 func (msg *{{.TypeName}}) UnmarshalJSON(b []byte) error {
 	return (&jsonpb.Unmarshaler{
-	  AllowUnknownFields: {{.AllowUnknownFields}},
+	  AllowUnknownFields: AllowUnknownFields,
 	}).Unmarshal(bytes.NewReader(b), msg)
 }
 `))
 )
+
+func marshal(w io.Writer, t tplMessage) error {
+	s, err := marshalMsg(w, t.Message)
+	if err != nil {
+		return err
+	}
+	w.Write([]byte("\n// MarshalJSON implements json.Marshale for " + t.TypeName() + "\n"))
+	w.Write([]byte("func (msg *" + t.TypeName() + ") MarshalJSON() ([]byte, error) {\n" +
+		"	var buf bytes.Buffer\n" +
+		"	var err error\n" +
+		s +
+		"	return buf.Bytes(), err\n" +
+		"}"))
+	return nil
+}
+
+func marshalMsg(w io.Writer, m *descriptor.Message) (string, error) {
+	var sb strings.Builder
+	sb.WriteString(`	buf.Write([]byte("{"))` + "\n")
+	for i, field := range m.Fields {
+		if i > 0 {
+			sb.WriteString(`	buf.Write([]byte(","))` + "\n")
+		}
+		sb.WriteString(`	buf.Write([]byte(jsonStringify("` + field.GetJsonName() + `")))` + "\n")
+		// FIXME: optional label
+		sb.WriteString(`	buf.Write([]byte(":"))` + "\n")
+		switch t := field.GetType(); t {
+		case descriptorpb.FieldDescriptorProto_TYPE_DOUBLE:
+			sb.WriteString(`	buf.Write(strconv.AppendFloat(nil, msg.Get` + strings.Title(field.GetName()) + `(), 'E', -1, 64))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_FLOAT:
+			sb.WriteString(`	buf.Write(strconv.AppendFloat(nil, float64(msg.Get` + strings.Title(field.GetName()) + `()), 'E', -1, 32))` + "\n")
+			// Not ZigZag encoded.  Negative numbers take 10 bytes.  Use TYPE_SINT64 if
+			// negative values are likely.
+		case descriptorpb.FieldDescriptorProto_TYPE_INT64,
+			descriptorpb.FieldDescriptorProto_TYPE_SINT64,
+			descriptorpb.FieldDescriptorProto_TYPE_SFIXED64:
+			sb.WriteString(`	buf.Write(strconv.AppendInt(nil, msg.Get` + strings.Title(field.GetName()) + `(), 10))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_UINT64,
+			descriptorpb.FieldDescriptorProto_TYPE_FIXED64:
+			sb.WriteString(`	buf.Write(strconv.AppendUint(nil, msg.Get` + strings.Title(field.GetName()) + `(), 10))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_INT32,
+			descriptorpb.FieldDescriptorProto_TYPE_SINT32,
+			descriptorpb.FieldDescriptorProto_TYPE_SFIXED32:
+			sb.WriteString(`	buf.Write(strconv.AppendInt(nil, int64(msg.Get` + strings.Title(field.GetName()) + `()), 10))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_FIXED32,
+			descriptorpb.FieldDescriptorProto_TYPE_UINT32:
+			sb.WriteString(`	buf.Write(strconv.AppendUint(nil, uint64(msg.Get` + strings.Title(field.GetName()) + `()), 10))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_BOOL:
+			sb.WriteString(`	buf.Write(strconv.AppendBool(nil, msg.Get` + strings.Title(field.GetName()) + `()))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_STRING:
+			sb.WriteString(`	buf.Write([]byte(jsonStringify(msg.Get` + strings.Title(field.GetName()) + `())))` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_MESSAGE:
+			// FIXME: GetMapEntry vs google proto stuff vs our own stuff we can call MarshalJSON().
+			sb.WriteString("	// field.GetTypeName() " + field.GetTypeName() + "\n")
+			sb.WriteString("	// field.GetType().Descriptor().Name() " + string(field.GetType().Descriptor().Name()) + "\n")
+			sb.WriteString("	// field.GetType().Descriptor().FullName() " + string(field.GetType().Descriptor().FullName()) + "\n")
+			sb.WriteString("	{\n")
+			sb.WriteString("		b, err := msg.Get" + strings.Title(field.GetName()) + "().MarshalJSON()\n")
+			sb.WriteString("		if err != nil {\n")
+			sb.WriteString("			return nil, err\n")
+			sb.WriteString("		}\n")
+			sb.WriteString("		buf.Write(b)\n")
+			sb.WriteString("	}\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_BYTES:
+			sb.WriteString(`	buf.Write(` + strings.Title(field.GetName()) + `())` + "\n")
+		case descriptorpb.FieldDescriptorProto_TYPE_ENUM:
+			// FIXME: EnumsAsInts
+			sb.WriteString(`	buf.Write([]byte(jsonStringify(msg.Get` + strings.Title(field.GetName()) + `().String())))` + "\n")
+		// Group type is deprecated and not supported in proto3. However,
+		// Proto3 implementations should still be able to parse the group wire
+		// format and treat group fields as unknown fields.
+		case descriptorpb.FieldDescriptorProto_TYPE_GROUP:
+			fallthrough
+		default:
+			return "", fmt.Errorf("%s: unkown protobuf field type", t)
+		}
+	}
+	sb.WriteString(`	buf.Write([]byte("}"))` + "\n")
+	return sb.String(), nil
+}
